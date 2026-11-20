@@ -1,291 +1,180 @@
-// Background service worker implementing RSI pledge scraping and upload to Citizen Hangar backend
-export default defineBackground(() => {
-  (async () => {
-type LogsEntry = { ts: string; level: string; msg: string; meta: any | null };
-
 const PROD_BASE = 'https://citizenhangar.space';
 const DEV_BASE = 'http://localhost:3000';
-const SYNC_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
-const LOG_LIMIT = 500;
+const RSI_BASE = 'https://robertsspaceindustries.com';
 
-async function getStore<T = any>(keys: string[] | Record<string, any>) {
-  const res = await browser.storage.local.get(keys as any);
-  return res as T;
-}
+type Outcome = 'success' | 'partial' | 'failed';
+type SyncResult = { ok: boolean; outcome: Outcome; error?: string };
+type Diagnostic = { ts: string; level: string; msg: string };
+type StoredState = {
+  eat?: string; connectionBase?: string; lastSync?: number; lastResult?: SyncResult;
+  devMode?: boolean; debugEnabled?: boolean; diagnostics?: Diagnostic[];
+};
 
-async function setStore(obj: Record<string, any>) {
-  await browser.storage.local.set(obj);
-}
-
-async function removeStore(keys: string | string[]) {
-  await browser.storage.local.remove(keys);
-}
-
-async function appendLog(level: string, msg: string, meta?: any) {
+function dashboardOrigin(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
   try {
-    const ts = new Date().toISOString();
-    const entry: LogsEntry = { ts, level, msg: String(msg), meta: meta ?? null };
-    const s = await getStore<{ debugEnabled?: boolean; __sctr_logs?: LogsEntry[] }>(['debugEnabled', '__sctr_logs']);
-    const debugEnabled = !!s.debugEnabled;
-    const logs = Array.isArray(s.__sctr_logs) ? s.__sctr_logs : [];
+    const url = new URL(value);
+    if (url.username || url.password) return undefined;
+    if (url.origin === PROD_BASE) return PROD_BASE;
+    if (url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)) return url.origin;
+  } catch { /* An invalid URL cannot receive extension credentials. */ }
+  return undefined;
+}
 
-    if (debugEnabled) {
-      if (level === 'error') console.error('[SCTR EXT]', ts, msg, meta || '');
-      else if (level === 'warn') console.warn('[SCTR EXT]', ts, msg, meta || '');
-      else console.log('[SCTR EXT]', ts, msg, meta || '');
-    }
+const defaultOrigin = (devMode?: boolean) => devMode ? DEV_BASE : PROD_BASE;
 
-    logs.unshift(entry);
-    if (logs.length > LOG_LIMIT) logs.length = LOG_LIMIT;
-    await setStore({ __sctr_logs: logs });
-  } catch (err) {
-    try { console.warn('appendLog failed', err); } catch (_) {}
+export default defineBackground(() => {
+  const read = () => browser.storage.local.get([
+    'eat', 'connectionBase', 'lastSync', 'lastResult', 'devMode', 'debugEnabled', 'diagnostics',
+  ]) as Promise<StoredState>;
+  // Old diagnostics included request bodies and pairing credentials.
+  const ready = browser.storage.local.remove('__sctr_logs');
+  let running: Promise<SyncResult> | undefined;
+
+  async function log(level: string, msg: string) {
+    const state = await read();
+    if (!state.debugEnabled) return;
+    const entry = { ts: new Date().toISOString(), level, msg };
+    await browser.storage.local.set({ diagnostics: [entry, ...(state.diagnostics || [])].slice(0, 100) });
   }
-}
 
-const debugLog = (m: string, meta?: any) => appendLog('debug', m, meta);
-const warnLog = (m: string, meta?: any) => appendLog('warn', m, meta);
-const errorLog = (m: string, meta?: any) => appendLog('error', m, meta);
-
-async function getSettings() {
-  const s = await getStore<{ devMode?: boolean; debugEnabled?: boolean }>(['devMode', 'debugEnabled']);
-  return { devMode: !!s.devMode, debugEnabled: !!s.debugEnabled };
-}
-
-async function getBaseUrl() {
-  const { devMode } = await getSettings();
-  return devMode ? DEV_BASE : PROD_BASE;
-}
-
-async function postToServer(path: string, body: any, options: { baseUrl?: string } = {}) {
-  try {
-    const base = options.baseUrl || (await getBaseUrl());
-    const url = base.replace(/\/$/, '') + (path.startsWith('/') ? path : `/${path}`);
-    await debugLog('postToServer: attempt', { url, body });
-
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(body),
-      mode: 'cors',
-      credentials: 'omit',
-      cache: 'no-store',
-    }).catch((err) => ({ networkError: true, err } as any));
-
-    if (!resp) {
-      await warnLog('postToServer: no response object', { path, body });
-      return { ok: false, error: 'no_response' };
-    }
-    if ((resp as any).networkError) {
-      return { ok: false, error: 'network_error', detail: (resp as any).err?.message };
-    }
-
-    const status = (resp as Response).status;
-    let json: any = null;
+  async function post(origin: string, path: string, body: Record<string, unknown>) {
     try {
-      json = await (resp as Response).json();
-    } catch (parseErr) {
-      const text = await (resp as Response).text().catch(() => null);
-      await warnLog('postToServer: response parse error', { url, status, text });
-      return { ok: false, error: 'parse_error', status, raw: text };
+      const response = await fetch(origin + path, {
+        method: 'POST', credentials: 'omit', cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20000),
+      });
+      return await response.json();
+    } catch {
+      return { ok: false, error: 'network_error' };
     }
-
-    if (status >= 200 && status < 300) {
-      await debugLog('postToServer: success', { url, status, json });
-      return json;
-    }
-
-    await warnLog('postToServer: HTTP error', { url, status, json });
-    return { ok: false, error: 'http_error', status, json };
-  } catch (err) {
-    await errorLog('postToServer: unexpected error', { err: err && (err as Error).message });
-    return { ok: false, error: 'internal_error', detail: err && (err as Error).message };
   }
-}
 
-async function fetchPledgesPage(page: number) {
-  const url = `https://robertsspaceindustries.com/account/pledges?page=${page}`;
-  const r = await fetch(url, { credentials: 'include' });
-  if (!r.ok) throw new Error(`RSI fetch failed status ${r.status}`);
-  return await r.text();
-}
+  async function fetchPledgePage(page: number) {
+    const response = await fetch(`${RSI_BASE}/account/pledges?page=${page}`, {
+      credentials: 'include', signal: AbortSignal.timeout(15000),
+    });
+    if (response.status === 401 || response.status === 403 ||
+      (response.redirected && !/\/account\/pledges\/?$/.test(new URL(response.url).pathname))) {
+      throw new Error('rsi_sign_in_required');
+    }
+    if (!response.ok) throw new Error('rsi_fetch_failed');
+    return response.text();
+  }
 
-async function collectPledgePages(maxPages = 250) {
-  const pages: string[] = [];
-  try {
-    const firstHtml = await fetchPledgesPage(1);
-    pages.push(firstHtml);
-
-    const matches = Array.from(firstHtml.matchAll(/[?&]page=(\d+)/g)).map((m) => parseInt(m[1], 10)).filter(Boolean);
-    let last = matches.length ? Math.max(...matches) : null;
-    if (!last) last = maxPages;
-    last = Math.min(last, 250);
-
-    for (let p = 2; p <= last; p += 1) {
+  function lastPageIn(html: string) {
+    let last = 1;
+    for (const match of html.matchAll(/<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>/gi)) {
       try {
-        const html = await fetchPledgesPage(p);
-        if (!/pledge/i.test(html)) break;
-        pages.push(html);
-      } catch (err) {
-        await warnLog('collectPledgePages: fetch error', { page: p, err: err && (err as Error).message });
-        break;
-      }
+        const url = new URL(match[1].replace(/&amp;/g, '&'), RSI_BASE);
+        const page = Number(url.searchParams.get('page'));
+        if (url.origin === RSI_BASE && /\/account\/pledges\/?$/.test(url.pathname)
+          && !url.searchParams.has('product-type') && Number.isSafeInteger(page)) last = Math.max(last, page);
+      } catch { /* Ignore malformed links. */ }
     }
-  } catch (err) {
-    await warnLog('collectPledgePages: initial fetch error', { err: err && (err as Error).message });
-  }
-  return pages;
-}
-
-async function doSync(options: { bypassCooldown?: boolean; baseUrl?: string } = { bypassCooldown: false }) {
-  const s = await getStore<{ eat?: string; lastSync?: number }>(['eat', 'lastSync']);
-  const eat = s.eat;
-  if (!eat) {
-    await warnLog('doSync aborted: not paired');
-    return { ok: false, error: 'not_paired' };
+    return last;
   }
 
-  const now = Date.now();
-  if (!options.bypassCooldown && s.lastSync && now - s.lastSync < SYNC_COOLDOWN_MS) {
-    await debugLog('doSync: cooldown active');
-    return { ok: false, error: 'cooldown' };
-  }
-
-  const pages = await collectPledgePages();
-  await debugLog('doSync: collected pages', { count: pages.length });
-
-  const resp = await postToServer('/api/extension/pledges', { eat, rawHtmlPages: pages }, { baseUrl: options.baseUrl });
-
-  if (resp && (resp as any).ok) {
-    await setStore({ lastSync: Date.now() });
-    await debugLog('doSync: server accepted', { count: pages.length });
-    return { ok: true };
-  }
-
-  await warnLog('doSync: server rejected', { resp });
-  return { ok: false, error: (resp && (resp as any).error) || 'server_reject' };
-}
-
-try {
-  browser.alarms?.create && browser.alarms.create('hourlySync', { periodInMinutes: 60 });
-} catch (err) {
-  await warnLog('alarms.create error', { err: err && (err as Error).message });
-}
-
-browser.alarms?.onAlarm?.addListener(async (alarm) => {
-  if (alarm && alarm.name === 'hourlySync') {
-    await debugLog('alarm fired: hourlySync');
-    await doSync({ bypassCooldown: true }).catch(() => {});
-  }
-});
-
-// Normalize incoming messages (support both `type` from the popup and `action` from older handlers)
-browser.runtime.onMessage.addListener((msg: any, sender, sendResponse) => {
-  // Use callback-style sendResponse and return true so the port stays open
-  void debugLog('onMessage received (callback)', { msg });
-
-  (async () => {
+  async function collectPledgePages() {
+    const pages: string[] = [];
+    let last = 1;
     try {
-      const action = msg?.action || msg?.type;
-      if (!action) {
-        await warnLog('onMessage: invalid message (no action/type)', { msg });
-        sendResponse({ ok: false, error: 'invalid_message' });
-        return;
+      for (let page = 1; page <= Math.min(last, 250); page += 1) {
+        const html = await fetchPledgePage(page);
+        pages.push(html);
+        last = Math.max(last, lastPageIn(html));
       }
-
-      if (action === 'createPair' || action === 'create-pair') {
-        await debugLog('createPair requested');
-        const url = (await getBaseUrl()).replace(/\/$/, '') + '/extension/api/create-pair';
-        try {
-          const resp = await fetch(url, { method: 'POST', credentials: 'include' });
-          const body = await resp.json().catch(() => null);
-          await debugLog('createPair result', { status: resp.status, body });
-          sendResponse({ status: resp.status, body });
-          return;
-        } catch (err) {
-          await errorLog('createPair error', { err: (err as any)?.message });
-          sendResponse({ ok: false, error: 'network_error', detail: (err as any)?.message });
-          return;
-        }
-      }
-
-      if (action === 'exchangeCode' || action === 'pair') {
-        const code = msg.code || (msg.payload && msg.payload.code);
-        if (!code || typeof code !== 'string') {
-          await warnLog('pair: missing code');
-          sendResponse({ ok: false, error: 'missing_code' });
-          return;
-        }
-        const baseOverride = typeof msg.baseUrl === 'string' ? msg.baseUrl : undefined;
-        if (typeof msg.devMode === 'boolean') await setStore({ devMode: !!msg.devMode });
-        await debugLog('pair: attempting', { code });
-        const payload = { code: String(code) };
-        const resp = await postToServer('/api/extension/pair', payload, { baseUrl: baseOverride });
-        if (resp && (resp as any).eat) {
-          await setStore({ eat: (resp as any).eat });
-          await debugLog('pair: EAT received and stored');
-          const syncRes = await doSync({ bypassCooldown: true, baseUrl: baseOverride });
-          await debugLog('pair: initial sync result', { syncRes });
-          sendResponse({ ok: true });
-          return;
-        }
-        await warnLog('pair failed', { resp });
-        sendResponse({ ok: false, error: 'pair_failed', detail: resp });
-        return;
-      }
-
-      if (action === 'triggerSync' || action === 'manual-sync' || action === 'initial-sync') {
-        await debugLog('manual sync requested', { bypassCooldown: true });
-        const res = await doSync({ bypassCooldown: true });
-        await debugLog('manual sync result', { res });
-        sendResponse(res);
-        return;
-      }
-
-      if (action === 'getStatus' || action === 'get-status') {
-        await debugLog('getStatus requested');
-        const items = await getStore(['eat', 'lastSync', 'devMode', 'debugEnabled', '__sctr_logs']);
-        sendResponse(items);
-        return;
-      }
-
-      if (action === 'set-settings') {
-        await debugLog('set-settings', { msg });
-        const updates: Record<string, any> = {};
-        if (typeof msg.devMode !== 'undefined') updates.devMode = !!msg.devMode;
-        if (typeof msg.debugEnabled !== 'undefined') updates.debugEnabled = !!msg.debugEnabled;
-        await setStore(updates);
-        await debugLog('set-settings saved', updates);
-        sendResponse({ ok: true });
-        return;
-      }
-
-      if (action === 'revoke') {
-        await removeStore(['eat', 'lastSync']);
-        await debugLog('revoke: cleared extension auth');
-        sendResponse({ ok: true });
-        return;
-      }
-
-      if (action === 'clear-logs') {
-        await setStore({ __sctr_logs: [] });
-        await debugLog('clear-logs');
-        sendResponse({ ok: true });
-        return;
-      }
-
-      await warnLog('Unknown action', { action, msg });
-      sendResponse({ ok: false, error: 'unknown_action' });
+      return { pages, issue: last > 250 ? 'incomplete_pages' : undefined };
     } catch (err) {
-      await errorLog('onMessage handler error', { err: err && (err as Error).message, msg });
-      sendResponse({ ok: false, error: 'internal_error', detail: err && (err as Error).message });
+      const signIn = err instanceof Error && err.message === 'rsi_sign_in_required';
+      return { pages, issue: pages.length ? 'incomplete_pages' : signIn ? 'rsi_sign_in_required' : 'rsi_fetch_failed' };
     }
-  })();
+  }
 
-  return true; // keep message channel open for async response
-});
+  async function performSync(): Promise<SyncResult> {
+    const state = await read();
+    const eat = state.eat;
+    if (!eat) return { ok: false, outcome: 'failed', error: 'not_paired' };
+    const origin = dashboardOrigin(state.connectionBase) || defaultOrigin(state.devMode);
+    const { pages, issue } = await collectPledgePages();
+    const result = await post(origin, '/api/extension/pledges', { eat, rawHtmlPages: pages, collectionIssue: issue });
+    const ok = result?.ok === true && !issue;
+    const outcome: Outcome = ok ? 'success' : result?.outcome === 'partial' || issue === 'incomplete_pages' ? 'partial' : 'failed';
+    const error = ok ? undefined : result?.error === 'invalid_eat' ? 'invalid_eat' : issue || result?.error || 'pledge_sync_failed';
+    const report = { ok, outcome, ...(error ? { error } : {}) };
+    if ((await read()).eat === eat) {
+      if (error === 'invalid_eat') await browser.storage.local.remove(['eat', 'connectionBase', 'lastSync']);
+      await browser.storage.local.set({ lastResult: report, ...(ok ? { lastSync: Date.now() } : {}) });
+    }
+    await log(ok ? 'info' : 'warn', `Sync ${outcome}`);
+    return report;
+  }
 
-    await debugLog('background initialized', { prod: PROD_BASE, local: DEV_BASE });
-  })();
+  function sync() {
+    if (!running) running = performSync().finally(() => { running = undefined; });
+    return running;
+  }
 
+  browser.alarms.create('hourlySync', { periodInMinutes: 60 });
+  browser.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === 'hourlySync') {
+      await ready;
+      await sync().catch(() => log('error', 'Scheduled sync could not finish.'));
+    }
+  });
+
+  browser.runtime.onMessage.addListener((message, _sender, reply) => {
+    async function handle() {
+      await ready;
+      const action = message?.action || message?.type;
+      const state = await read();
+      if (action === 'getStatus' || action === 'get-status') {
+        return {
+          paired: Boolean(state.eat), syncing: Boolean(running), lastSync: state.lastSync,
+          lastResult: state.lastResult, devMode: Boolean(state.devMode), debugEnabled: Boolean(state.debugEnabled),
+          dashboardUrl: defaultOrigin(state.devMode),
+          connectionBase: dashboardOrigin(state.connectionBase) || defaultOrigin(state.devMode),
+          diagnostics: state.diagnostics || [],
+        };
+      }
+      if (action === 'exchangeCode' || action === 'pair') {
+        const code = message.code || message.payload?.code;
+        if (typeof code !== 'string' || !/^\d{6}$/.test(code)) return { ok: false, error: 'invalid_code' };
+        const origin = message.baseUrl === undefined ? defaultOrigin(state.devMode) : dashboardOrigin(message.baseUrl);
+        if (!origin) return { ok: false, error: 'invalid_dashboard' };
+        const result = await post(origin, '/api/extension/pair', { code });
+        if (!result?.eat) return { ok: false, error: result?.error || 'pair_failed' };
+        if (running) await running.catch(() => {});
+        await browser.storage.local.remove(['lastSync', 'lastResult']);
+        await browser.storage.local.set({ eat: result.eat, connectionBase: origin, devMode: origin !== PROD_BASE });
+        await log('info', 'Browser paired.');
+        return { ok: true };
+      }
+      if (action === 'triggerSync' || action === 'manual-sync' || action === 'initial-sync') return sync();
+      if (action === 'set-settings') {
+        const settings: Partial<StoredState> = {};
+        if (typeof message.devMode === 'boolean') {
+          settings.devMode = message.devMode;
+          if (state.eat && !state.connectionBase) settings.connectionBase = defaultOrigin(state.devMode);
+        }
+        if (typeof message.debugEnabled === 'boolean') settings.debugEnabled = message.debugEnabled;
+        await browser.storage.local.set(settings);
+        return { ok: true };
+      }
+      if (action === 'clear-logs') {
+        await browser.storage.local.remove('diagnostics');
+        return { ok: true };
+      }
+      if (action === 'revoke') {
+        await browser.storage.local.remove(['eat', 'connectionBase', 'lastSync', 'lastResult']);
+        await log('info', 'Browser disconnected.');
+        return { ok: true };
+      }
+      return { ok: false, error: 'unknown_action' };
+    }
+    void handle().then(reply, () => reply({ ok: false, error: 'internal_error' }));
+    return true;
+  });
 });

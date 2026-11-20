@@ -17,12 +17,19 @@ export default defineConfig({
       ? [...hostPermissionsBase, 'http://localhost/*', 'http://127.0.0.1/*']
       : hostPermissionsBase;
 
+    const gecko = {
+      id: 'citizenhangar@sctr.space',
+      data_collection_permissions: {
+        required: ['authenticationInfo', 'websiteContent', 'websiteActivity'],
+        optional: [],
+      },
+    };
+
     const manifest: UserManifest = {
       name: 'Citizen Hangar Pledge Sync',
       description:
         'Sync Robert Space Industries pledges to the Citizen Hangar backend; pairing and uploads',
-      manifest_version: 3,
-      version: '1.3.4',
+      version: '1.3.5',
       action: {
         default_popup: 'entrypoints/popup/index.html',
       },
@@ -36,17 +43,7 @@ export default defineConfig({
         service_worker: 'entrypoints/background.js',
       },
       // Firefox-specific manifest field recommended by AMO
-      browser_specific_settings: {
-        gecko: {
-          id: 'citizenhangar@sctr.space',
-          // AMO data collection schema: list required/optional data types
-          data_collection_permissions: {
-            // Required data types collected/transmitted by the add-on (AMO schema)
-            required: ['authenticationInfo', 'websiteContent', 'websiteActivity'],
-            optional: [],
-          },
-        },
-      },
+      browser_specific_settings: { gecko },
       permissions: ['storage', 'alarms'],
       host_permissions,
       // content scripts are declared via `defineContentScript` in entrypoints/content.ts

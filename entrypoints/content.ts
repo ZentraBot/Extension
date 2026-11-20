@@ -44,11 +44,10 @@ export default defineContentScript({
         const g = globalThis as any;
         if (g.browser && g.browser.runtime) {
           try {
-            console.debug('content: sending message via browser.runtime', payload);
             return await g.browser.runtime.sendMessage(payload);
           } catch (err) {
             console.warn('content: browser.runtime.sendMessage threw', err);
-            return { ok: false, error: (err && err.message) || 'runtime_error' };
+            return { ok: false, error: err instanceof Error ? err.message : 'runtime_error' };
           }
         }
 
@@ -60,21 +59,20 @@ export default defineContentScript({
           try {
             return await g.browser.runtime.sendMessage(payload);
           } catch (err) {
-            return { ok: false, error: (err && err.message) || 'runtime_error' };
+            return { ok: false, error: err instanceof Error ? err.message : 'runtime_error' };
           }
         }
 
         // Otherwise use chrome.runtime (callback) wrapped into a Promise.
         return new Promise((resolve) => {
           try {
-            console.debug('content: sending message via chrome.runtime (callback)', payload);
             g.chrome.runtime.sendMessage(payload, (response: any) => {
               const err = g.chrome && g.chrome.runtime && g.chrome.runtime.lastError;
               if (err) resolve({ ok: false, error: (err as any).message || 'runtime_error' });
               else resolve(response);
             });
           } catch (err) {
-            resolve({ ok: false, error: (err && err.message) || 'runtime_error' });
+            resolve({ ok: false, error: err instanceof Error ? err.message : 'runtime_error' });
           }
         });
       })();
