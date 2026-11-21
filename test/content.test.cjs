@@ -5,29 +5,17 @@ const { runEntry } = require('./compileEntry.cjs');
 
 const productionOrigin = 'https://citizenhangar.space';
 const channel = 'CITIZEN_HANGAR_EXTENSION';
+const legacy = 'SCTR_EXTENSION';
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-/** Record page messages without forwarding them back through the real browser. */
-function bridge({
-  origin = productionOrigin,
-  profile = 'production',
-  browser,
-  chrome,
-  warn = () => {},
-} = {}) {
+/** Provide a same-window bridge and record messages without a browser install. */
+function bridge({ origin = productionOrigin, profile = 'production', browser, chrome } = {}) {
   const posts = [];
-  const events = [];
   let listener;
-  let ready;
-  let interval;
-  let clock = 0;
   const window = {
     location: { origin },
     addEventListener(_name, handler) {
       listener = handler;
-    },
-    dispatchEvent(event) {
-      events.push(event);
     },
     postMessage(message, target) {
       posts.push({ message, target });
@@ -37,173 +25,176 @@ function bridge({
     window,
     browser,
     chrome,
-    Error,
-    URL,
-    CustomEvent,
-    Date: { now: () => clock },
-    document: {
-      readyState: 'loading',
-      addEventListener(_name, handler) {
-        ready = handler;
-      },
-    },
-    setInterval(callback) {
-      interval = callback;
-      return 1;
-    },
-    clearInterval() {},
     defineContentScript: (entry) => entry,
     process: { env: { CH_BUILD_PROFILE: profile } },
-    require() {
-      return { browserWarning: warn };
-    },
   });
   const entry = runEntry('entrypoints/content.ts', context);
   entry.main();
   return {
-    context,
     entry,
     posts,
-    events,
-    ready,
-    tick(milliseconds) {
-      clock += milliseconds;
-      interval();
-    },
-    message(type, data = {}, event = {}) {
-      listener({
+    message(type, fields = {}, event = {}) {
+      listener?.({
         source: window,
         origin,
-        data: { target: channel, requestId: 'req', type, ...data },
+        data: { target: channel, requestId: 'req', type, protocol: 2, ...fields },
         ...event,
       });
     },
   };
 }
 
-test('content announces readiness once and accepts messages from its own allowed page', async () => {
-  let calls = 0;
+test('content checks the worker for readiness and forwards only sanitized confirmation status', async () => {
+  const commands = [];
   let finish;
   const fixture = bridge({
     browser: {
       runtime: {
-        sendMessage(message) {
-          calls += 1;
-          if (message.action === 'pair')
+        sendMessage(command) {
+          commands.push(JSON.parse(JSON.stringify(command)));
+          if (command.action === 'bridge-pair') {
             return new Promise((resolve) => {
               finish = resolve;
             });
-          return { ok: true };
+          }
+          return { ok: true, accountName: 'Private account' };
         },
       },
     },
   });
+  assert.equal(fixture.entry.allFrames, false);
   assert.equal(fixture.posts.length, 2);
-  assert.equal(fixture.events.length, 2);
-  fixture.ready();
-  assert.equal(fixture.posts.length, 2);
-  fixture.message('PING');
+  assert.equal(fixture.posts[0].message.type, 'READY');
+  assert.equal(fixture.posts[1].message.source, legacy);
+  fixture.message('PING', { requestId: 'check' });
+  await settle();
   assert.equal(fixture.posts.at(-1).message.type, 'PONG');
-  fixture.message('PAIR', { payload: { code: '123456' } }, { origin: 'https://other.example' });
-  fixture.message('PAIR', { payload: { code: '123456' } }, { source: {} });
-  assert.equal(calls, 0);
-  fixture.message('PAIR', { payload: { code: '123456' } });
-  fixture.message('PAIR', { payload: { code: '123456' } });
-  assert.equal(calls, 1);
-  finish({ ok: true });
+  assert.equal(fixture.posts.at(-1).message.protocol, 2);
+  assert.deepEqual(commands, [{ action: 'bridge-ping' }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(fixture.posts.at(-1).message.response)), { ok: true });
+
+  const payload = { code: '123456', baseUrl: 'https://wrong.example', accountName: 'Untrusted' };
+  fixture.message('PAIR', { payload }, { origin: 'https://other.example' });
+  fixture.message('PAIR', { payload }, { source: {} });
+  fixture.message('PAIR', { payload, target: 'unknown' });
+  fixture.message('PAIR', {}, { data: null });
+  fixture.message('PAIR', { payload, requestId: [] });
+  fixture.message('UNKNOWN');
+  assert.equal(commands.length, 1);
+
+  fixture.message('PAIR', { payload });
+  fixture.message('PAIR', { payload, target: legacy });
+  assert.deepEqual(commands.at(-1), { action: 'bridge-pair', code: '123456' });
+  assert.equal(commands.length, 2);
+  finish({ ok: true, confirmationRequired: true, eat: 'secret', accountName: 'Private account' });
   await settle();
+  fixture.message('PAIR', { payload, target: legacy });
+  assert.equal(commands.length, 2);
   assert.equal(fixture.posts.at(-1).message.type, 'PAIR_RESULT');
-  fixture.message('REVOKE');
+  assert.deepEqual(JSON.parse(JSON.stringify(fixture.posts.at(-1).message.response)), {
+    ok: true,
+    confirmationRequired: true,
+  });
+
+  fixture.message('REVOKE', { requestId: 'revoke' });
+  fixture.message('REVOKE', { requestId: 'revoke', target: legacy });
   await settle();
+  fixture.message('REVOKE', { requestId: 'revoke', target: legacy });
+  assert.deepEqual(commands.at(-1), { action: 'bridge-revoke' });
+  assert.equal(commands.length, 3);
   assert.equal(fixture.posts.at(-1).message.type, 'REVOKE_RESULT');
 });
 
-test('content handles Chrome callback errors and late or missing runtimes', async () => {
+test('legacy bridge mutations are refused and development origins remain scoped to their own page', async () => {
+  const production = bridge({ origin: 'http://localhost:3000' });
+  assert.equal(production.posts.length, 0);
+  let requests = 0;
+  const development = bridge({
+    origin: 'http://localhost:3000',
+    profile: 'development',
+    browser: {
+      runtime: {
+        sendMessage() {
+          requests += 1;
+          return { ok: false, error: 'pair_pending', debug: 'sensitive' };
+        },
+      },
+    },
+  });
+  assert.ok(development.entry.matches.includes('http://localhost/*'));
+  development.message('REVOKE', { protocol: undefined });
+  assert.equal(development.posts.at(-1).message.response.error, 'confirmation_required');
+  development.message('PAIR', { payload: { code: 'bad' } });
+  assert.equal(development.posts.at(-1).message.response.error, 'invalid_code');
+  development.message('PAIR');
+  assert.equal(development.posts.at(-1).message.response.error, 'invalid_code');
+  development.message('PAIR', { payload: { code: '123456' } }, { origin: productionOrigin });
+  assert.equal(requests, 0);
+  development.message('PAIR', { payload: { code: '123456' } });
+  await settle();
+  assert.deepEqual(JSON.parse(JSON.stringify(development.posts.at(-1).message.response)), {
+    ok: false,
+    error: 'pair_pending',
+  });
+  assert.equal(development.posts.at(-1).target, 'http://localhost:3000');
+});
+
+test('runtime failures and unknown reply fields are redacted across browsers', async () => {
   const runtime = {
-    lastError: { message: 'Runtime unavailable' },
-    sendMessage(_message, callback) {
+    lastError: { message: 'Private message' },
+    sendMessage(_command, callback) {
       callback({ ok: true });
     },
   };
-  const callbacks = bridge({ chrome: { runtime } });
-  callbacks.message('REVOKE');
-  await settle();
-  assert.equal(callbacks.posts.at(-1).message.response.error, 'Runtime unavailable');
-  runtime.lastError = undefined;
-  callbacks.message('REVOKE');
-  await settle();
-  assert.equal(callbacks.posts.at(-1).message.response.ok, true);
-
-  const missing = bridge();
-  missing.message('REVOKE');
-  missing.tick(5000);
-  await settle();
-  assert.equal(missing.posts.at(-1).message.response.error, 'no_runtime_available');
-
-  const late = bridge();
-  late.message('REVOKE');
-  late.context.browser = { runtime: { sendMessage: async () => ({ ok: true }) } };
-  late.tick(100);
-  await settle();
-  assert.equal(late.posts.at(-1).message.response.ok, true);
-});
-
-test('content permits loopback only in development and reports rejected promises', async () => {
-  const prod = bridge({ origin: 'http://localhost:3000' });
-  assert.equal(prod.posts.length, 0);
-  const warnings = [];
-  const dev = bridge({
-    origin: 'http://localhost:3000',
-    profile: 'development',
-    warn: (...args) => warnings.push(args),
+  const firefox = bridge({
     browser: {
       runtime: {
-        sendMessage: async () => {
-          throw new Error('Offline');
+        sendMessage() {
+          throw new Error('Unexpected private error');
         },
       },
     },
   });
-  assert.ok(dev.entry.matches.includes('http://localhost/*'));
-  dev.message('REVOKE', { target: 'unknown' });
-  dev.message('REVOKE');
+  const chrome = bridge({ chrome: { runtime } });
+  const absent = bridge();
+  for (const fixture of [chrome, absent, firefox]) {
+    fixture.message('PING');
+    await settle();
+    assert.equal(fixture.posts.at(-1).message.response.error, 'runtime_error');
+  }
+  runtime.lastError = undefined;
+  chrome.message('PING', { requestId: 'next' });
   await settle();
-  assert.equal(dev.posts.at(-1).message.response.error, 'Offline');
-  assert.equal(warnings.length, 1);
+  assert.equal(chrome.posts.at(-1).message.response.ok, true);
+
+  runtime.sendMessage = (_command, callback) => callback({ ok: false, error: 'private' });
+  chrome.message('PING', { requestId: 'malformed' });
+  await settle();
+  assert.equal(chrome.posts.at(-1).message.response.error, 'runtime_error');
+  runtime.sendMessage = () => {
+    throw new Error('Runtime rejected');
+  };
+  chrome.message('PING', { requestId: 'throw' });
+  await settle();
+  assert.equal(chrome.posts.at(-1).message.response.error, 'runtime_error');
 });
 
-test('late runtime failures and synchronous Chrome errors return diagnostic codes', async () => {
-  const errors = bridge();
-  errors.message('REVOKE');
-  errors.context.browser = {
-    runtime: {
-      sendMessage: async () => {
-        throw 'Rejected without an Error';
-      },
-    },
-  };
-  errors.tick(100);
-  await settle();
-  assert.equal(errors.posts.at(-1).message.response.error, 'runtime_error');
-
-  const thrower = bridge({
-    chrome: {
-      runtime: {
-        sendMessage() {
-          throw Error('Callback failed');
-        },
-      },
-    },
+test('the bridge bounds pending work and trims completed request identifiers', async () => {
+  const queue = [];
+  const fixture = bridge({
+    browser: { runtime: { sendMessage: () => new Promise((resolve) => queue.push(resolve)) } },
   });
-  thrower.message('REVOKE');
+  for (let index = 0; index < 9; index += 1) fixture.message('PING', { requestId: 'req-' + index });
+  assert.equal(queue.length, 8);
+  for (const reply of queue.splice(0)) reply({ ok: true });
   await settle();
-  assert.equal(thrower.posts.at(-1).message.response.error, 'Callback failed');
-  thrower.context.chrome.runtime.sendMessage = (_message, callback) => {
-    callback({ ok: true });
-  };
-  thrower.context.chrome.runtime.lastError = {};
-  thrower.message('REVOKE');
+  for (let index = 9; index < 35; index += 1) {
+    fixture.message('PING', { requestId: 'req-' + index });
+    queue.shift()(undefined);
+    await settle();
+  }
+  fixture.message('PING', { requestId: 'req-0' });
+  assert.equal(queue.length, 1);
+  queue.shift()({ ok: true });
   await settle();
-  assert.equal(thrower.posts.at(-1).message.response.error, 'runtime_error');
-  thrower.message('IGNORED', { requestId: undefined });
 });

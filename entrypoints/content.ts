@@ -1,183 +1,147 @@
 import { browserWarning } from '../utils/console';
 
-const hostMatchesBase = ['https://citizenhangar.space/*'];
-const isDev = process.env.CH_BUILD_PROFILE === 'development';
-const matches = isDev
-  ? [...hostMatchesBase, 'http://localhost/*', 'http://127.0.0.1/*']
-  : hostMatchesBase;
+const productionOrigin = 'https://citizenhangar.space';
+const isDevelopment = process.env.CH_BUILD_PROFILE === 'development';
+const matches = isDevelopment
+  ? [productionOrigin + '/*', 'http://localhost/*', 'http://127.0.0.1/*']
+  : [productionOrigin + '/*'];
+const channels = ['CITIZEN_HANGAR_EXTENSION', 'SCTR_EXTENSION'];
+const protocol = 2;
+const errors = new Set([
+  'confirmation_required',
+  'invalid_code',
+  'invalid_dashboard',
+  'code_expired_or_invalid',
+  'confirmation_expired',
+  'extension_disabled',
+  'import_busy',
+  'network_error',
+  'pair_pending',
+  'rate_limited',
+  'runtime_error',
+]);
+
+type BridgeCommand =
+  { action: 'bridge-ping' } | { action: 'bridge-pair'; code: string } | { action: 'bridge-revoke' };
+type BridgeResponse = { ok: boolean; error?: string; confirmationRequired?: true };
+type ChromeRuntime = {
+  sendMessage: (message: BridgeCommand, callback: (response: unknown) => void) => void;
+  lastError?: unknown;
+};
+
+/** Use the browser API in the isolated world. Only controlled error codes cross to the page. */
+async function sendCommand(command: BridgeCommand): Promise<unknown> {
+  const runtime = globalThis as typeof globalThis & {
+    browser?: { runtime?: { sendMessage: (message: BridgeCommand) => Promise<unknown> } };
+    chrome?: { runtime?: ChromeRuntime };
+  };
+  if (runtime.browser?.runtime) return runtime.browser.runtime.sendMessage(command);
+
+  const chrome = runtime.chrome?.runtime;
+  if (!chrome) return { ok: false, error: 'runtime_error' };
+  return new Promise((resolve) => {
+    chrome.sendMessage(command, (response) => {
+      resolve(chrome.lastError ? { ok: false, error: 'runtime_error' } : response);
+    });
+  });
+}
+
+/** Forward only the result fields needed for UI feedback. Credentials and identities stay isolated. */
+function pageResponse(response: unknown): BridgeResponse {
+  const value = response as {
+    ok?: unknown;
+    error?: unknown;
+    confirmationRequired?: unknown;
+  } | null;
+  if (value?.ok === true) {
+    return value.confirmationRequired === true
+      ? { ok: true, confirmationRequired: true }
+      : { ok: true };
+  }
+  const error =
+    typeof value?.error === 'string' && errors.has(value.error) ? value.error : 'runtime_error';
+  return { ok: false, error };
+}
 
 export default defineContentScript({
   matches,
+  allFrames: false,
   main() {
-    const runtime = (globalThis as any).browser?.runtime ?? (globalThis as any).chrome?.runtime;
-    const CHANNEL_NAMES = ['CITIZEN_HANGAR_EXTENSION', 'SCTR_EXTENSION'];
-    const READY_EVENTS = ['citizen-hangar-extension-ready', 'sctr-extension-ready'];
-    const isAllowedOrigin = (origin: string) =>
-      origin === 'https://citizenhangar.space' ||
-      (isDev && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin));
-
-    /** Forward one validated Dashboard message using the runtime available in this browser. */
-    function sendRuntimeMessage(payload: any) {
-      // Helper: wait for a runtime to appear (browser or chrome) for up to `timeoutMs`.
-      const waitForRuntime = (timeoutMs = 5000, pollMs = 100) => {
-        const g = globalThis as any;
-        if (g.browser?.runtime || g.chrome?.runtime) return Promise.resolve(true);
-        return new Promise<boolean>((resolve) => {
-          const start = Date.now();
-          const id = setInterval(() => {
-            if (g.browser?.runtime || g.chrome?.runtime) {
-              clearInterval(id);
-              resolve(true);
-              return;
-            }
-            if (Date.now() - start >= timeoutMs) {
-              clearInterval(id);
-              resolve(false);
-            }
-          }, pollMs);
-        });
-      };
-
-      // Attempt to use the Promise-based `browser.runtime` first; if not present, wait briefly for the runtime.
-      return (async () => {
-        const g = globalThis as any;
-        if (g.browser && g.browser.runtime) {
-          try {
-            return await g.browser.runtime.sendMessage(payload);
-          } catch (err) {
-            browserWarning('The extension runtime rejected a Dashboard message', err);
-            return { ok: false, error: err instanceof Error ? err.message : 'runtime_error' };
-          }
-        }
-
-        const available = await waitForRuntime(5000, 100);
-        if (!available) return { ok: false, error: 'no_runtime_available' };
-
-        // If browser runtime appeared, use it.
-        if (g.browser && g.browser.runtime) {
-          try {
-            return await g.browser.runtime.sendMessage(payload);
-          } catch (err) {
-            return { ok: false, error: err instanceof Error ? err.message : 'runtime_error' };
-          }
-        }
-
-        // Otherwise use chrome.runtime (callback) wrapped into a Promise.
-        return new Promise((resolve) => {
-          try {
-            g.chrome.runtime.sendMessage(payload, (response: any) => {
-              const err = g.chrome && g.chrome.runtime && g.chrome.runtime.lastError;
-              if (err) resolve({ ok: false, error: (err as any).message || 'runtime_error' });
-              else resolve(response);
-            });
-          } catch (err) {
-            resolve({ ok: false, error: err instanceof Error ? err.message : 'runtime_error' });
-          }
-        });
-      })();
-    }
-
-    /** Send a bridge response back to the same origin that issued the request. */
-    function reply(origin: string, payload: any, channel = CHANNEL_NAMES[0]) {
-      try {
-        window.postMessage({ source: channel, ...payload }, origin);
-      } catch (_) {
-        // ignore
-      }
-    }
-
     const pageOrigin = window.location.origin;
-    let readyAnnounced = false;
-    const activeRequests = new Set<string>();
+    const allowed =
+      pageOrigin === productionOrigin ||
+      (isDevelopment && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(pageOrigin));
+    if (!allowed) return;
 
-    /** Announce both channel names once for compatibility with older Dashboard pages. */
-    function announceReady() {
-      if (readyAnnounced) return;
-      if (!isAllowedOrigin(pageOrigin)) return;
-      readyAnnounced = true;
-      CHANNEL_NAMES.forEach((channel) => reply(pageOrigin, { type: 'READY' }, channel));
-      READY_EVENTS.forEach((eventName) => {
-        try {
-          window.dispatchEvent(new CustomEvent(eventName, { detail: { origin: pageOrigin } }));
-        } catch (_) {}
-      });
-    }
+    // The two channel names support old listeners. Keep recently settled IDs as well as
+    // active IDs to stop the redundant message from reaching the worker after a quick reply.
+    const active = new Set<string>();
+    const settled = new Set<string>();
+    for (const source of channels)
+      window.postMessage({ source, type: 'READY', protocol }, pageOrigin);
 
-    announceReady();
-    if (document.readyState === 'loading')
-      document.addEventListener('DOMContentLoaded', announceReady);
+    window.addEventListener('message', (event: MessageEvent) => {
+      if (event.source !== window || event.origin !== pageOrigin) return;
+      const data = event.data;
+      if (!data || !channels.includes(data.target)) return;
+      const { target, requestId, type } = data;
+      if (typeof requestId !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(requestId)) return;
+      if (active.has(requestId) || settled.has(requestId) || active.size >= 8) return;
 
-    window.addEventListener('message', (event) => {
-      if (event.source !== window) return;
-      if (!isAllowedOrigin(event.origin)) return;
-      const { data } = event as any;
-      if (!data || !CHANNEL_NAMES.includes(data.target)) return;
+      let command: BridgeCommand;
+      let responseType: string;
+      switch (type) {
+        case 'PING':
+          command = { action: 'bridge-ping' };
+          responseType = 'PONG';
+          break;
+        case 'PAIR':
+          command = { action: 'bridge-pair', code: data.payload?.code };
+          responseType = 'PAIR_RESULT';
+          break;
+        case 'REVOKE':
+          command = { action: 'bridge-revoke' };
+          responseType = 'REVOKE_RESULT';
+          break;
+        default:
+          return;
+      }
 
-      const { requestId } = data;
-      const channel = data.target;
+      function reply(response: BridgeResponse) {
+        window.postMessage(
+          { source: target, type: responseType, protocol, requestId, response },
+          pageOrigin,
+        );
+      }
 
-      if (data.type === 'PING') {
-        reply(event.origin, { type: 'PONG', requestId }, channel);
+      // Old Dashboards can still detect the add-on and use the manual popup form.
+      // A legacy mutation request cannot bypass popup confirmation or scoped verification.
+      if (type !== 'PING' && data.protocol !== protocol) {
+        reply({ ok: false, error: 'confirmation_required' });
+        return;
+      }
+      if (
+        command.action === 'bridge-pair' &&
+        (typeof command.code !== 'string' || !/^\d{6}$/.test(command.code))
+      ) {
+        reply({ ok: false, error: 'invalid_code' });
         return;
       }
 
-      if (requestId && activeRequests.has(requestId)) return;
-      if (requestId) activeRequests.add(requestId);
-
-      const finalizeRequest = () => {
-        if (requestId) activeRequests.delete(requestId);
-      };
-
-      if (data.type === 'PAIR' && data.payload && data.payload.code) {
-        sendRuntimeMessage({
-          action: 'pair',
-          code: data.payload.code,
-          baseUrl: data.payload.baseUrl,
-          devMode: data.payload.devMode,
-        })
-          .then((response: any) =>
-            reply(event.origin, { type: 'PAIR_RESULT', requestId, response }, channel),
-          )
-          .catch((error: any) =>
-            reply(
-              event.origin,
-              {
-                type: 'PAIR_RESULT',
-                requestId,
-                response: {
-                  ok: false,
-                  error: error && error.message ? error.message : 'runtime_error',
-                },
-              },
-              channel,
-            ),
-          )
-          .finally(finalizeRequest);
-        return;
-      }
-
-      if (data.type === 'REVOKE') {
-        sendRuntimeMessage({ action: 'revoke' })
-          .then((response: any) =>
-            reply(event.origin, { type: 'REVOKE_RESULT', requestId, response }, channel),
-          )
-          .catch((error: any) =>
-            reply(
-              event.origin,
-              {
-                type: 'REVOKE_RESULT',
-                requestId,
-                response: {
-                  ok: false,
-                  error: error && error.message ? error.message : 'runtime_error',
-                },
-              },
-              channel,
-            ),
-          )
-          .finally(finalizeRequest);
-      }
-      finalizeRequest();
+      active.add(requestId);
+      void sendCommand(command)
+        .then(
+          (response) => reply(pageResponse(response)),
+          () => {
+            browserWarning('The background worker did not respond.', 'runtime_error');
+            reply({ ok: false, error: 'runtime_error' });
+          },
+        )
+        .finally(() => {
+          active.delete(requestId);
+          settled.add(requestId);
+          if (settled.size > 32) settled.delete(settled.values().next().value!);
+        });
     });
   },
 });

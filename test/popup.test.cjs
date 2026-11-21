@@ -166,6 +166,9 @@ test('popup explains each actionable import failure', async (t) => {
     ['invalid_page', 'failed', /size limit/],
     ['import_too_large', 'failed', /size limit/],
     ['rsi_sign_in_required', 'failed', /Sign in to RSI/],
+    ['rsi_account_unverified', 'failed', /could not verify/],
+    ['rsi_page_unverified', 'failed', /could not verify/],
+    ['rsi_account_confirmation_required', 'failed', /Review the active RSI account/],
     ['partial_sync', 'partial', /previous inventory/],
     ['invalid_eat', 'failed', /paired again/],
     ['not_paired', 'failed', /paired again/],
@@ -179,7 +182,10 @@ test('popup explains each actionable import failure', async (t) => {
     });
     await settle();
     assert.match(view.get('feedback').textContent, phrase);
-    assert.equal(view.get('rsi-login').hidden, error !== 'rsi_sign_in_required');
+    assert.equal(
+      view.get('rsi-login').hidden,
+      !['rsi_sign_in_required', 'rsi_account_unverified', 'rsi_page_unverified'].includes(error),
+    );
   }
 });
 
@@ -238,4 +244,184 @@ test('popup serializes a pending action and watches a new manual sync', async (t
   view.event('debug', 'change');
   await settle();
   assert.match(view.get('feedback').textContent, /could not complete/);
+});
+
+test('the popup previews a manual pairing offer before redeeming its reviewed identifier', async (t) => {
+  const pendingPair = {
+    id: 'manual-preview',
+    accountName: '<span>Dashboard pilot</span>',
+    expiresAt: '2026-11-21T12:00:00Z',
+  };
+  const view = popup(t, {}, (message, status) => {
+    if (message.type === 'exchangeCode') {
+      assert.equal(message.code, '123456');
+      status.pendingPair = pendingPair;
+      return { ok: true, confirmationRequired: true };
+    }
+    assert.equal(message.type, 'confirm-pair');
+    assert.equal(message.id, pendingPair.id);
+    status.pendingPair = undefined;
+    status.paired = true;
+    status.pairedAccountName = pendingPair.accountName;
+    return { ok: true };
+  });
+  await settle();
+  view.get('code').value = '123456';
+  view.event('pair-form', 'submit');
+  await settle();
+  assert.equal(view.get('pair-confirmation').hidden, false);
+  assert.equal(view.get('pairing').hidden, true);
+  assert.equal(view.get('connected').hidden, true);
+  assert.equal(view.get('pending-account').textContent, pendingPair.accountName);
+  assert.equal(view.get('pending-account').children.length, 0);
+  assert.equal(view.get('code').value, '');
+  assert.match(view.get('feedback').textContent, /Review the Dashboard account/);
+  view.event('confirm-pair', 'click');
+  await settle();
+  assert.equal(view.get('pair-confirmation').hidden, true);
+  assert.equal(view.get('connected').hidden, false);
+  assert.equal(view.get('paired-account').textContent, pendingPair.accountName);
+  assert.match(view.get('feedback').textContent, /Browser paired/);
+});
+
+test('the popup shows what it reviewed and rejects a superseded pairing or RSI source', async (t) => {
+  const view = popup(
+    t,
+    {
+      paired: true,
+      pendingPair: { id: 'before', accountName: 'Old destination' },
+      pendingRsiAccount: { id: 'rsi-before', label: 'Old RSI account' },
+    },
+    (message, status) => {
+      if (message.type === 'confirm-pair') {
+        assert.equal(message.id, 'before');
+        status.pendingPair = { id: 'after', accountName: 'New destination' };
+        return { ok: false };
+      }
+      if (message.type === 'confirm-rsi-account') {
+        assert.equal(message.id, 'rsi-before');
+        status.pendingRsiAccount = { id: 'rsi-after', label: 'New RSI account' };
+        return { ok: false };
+      }
+      if (message.type === 'dismiss-pair') {
+        assert.equal(message.id, 'after');
+        status.pendingPair = undefined;
+        return { ok: true };
+      }
+      assert.equal(message.type, 'dismiss-rsi-account');
+      assert.equal(message.id, 'rsi-after');
+      status.pendingRsiAccount = undefined;
+      return { ok: true };
+    },
+  );
+  await settle();
+  assert.equal(view.get('sync').disabled, true);
+  assert.equal(view.get('pending-account').textContent, 'Old destination');
+  assert.equal(view.get('pending-rsi-account').textContent, 'Old RSI account');
+  view.event('confirm-pair', 'click');
+  await settle();
+  assert.match(view.get('feedback').textContent, /Could not approve this pairing/);
+  assert.equal(view.get('pending-account').textContent, 'New destination');
+  view.event('dismiss-pair', 'click');
+  await settle();
+  assert.equal(view.get('pair-confirmation').hidden, true);
+  assert.match(view.get('feedback').textContent, /Pairing declined/);
+  view.event('confirm-rsi', 'click');
+  await settle();
+  assert.match(view.get('feedback').textContent, /could not be confirmed/);
+  assert.equal(view.get('pending-rsi-account').textContent, 'New RSI account');
+  view.event('dismiss-rsi', 'click');
+  await settle();
+  assert.equal(view.get('rsi-confirmation').hidden, true);
+  assert.match(view.get('feedback').textContent, /RSI account declined/);
+  assert.equal(view.get('sync').disabled, false);
+});
+
+test('approving the active RSI account can resume sync and disconnect is device-only', async (t) => {
+  let disconnectAllowed = false;
+  const view = popup(
+    t,
+    {
+      paired: true,
+      pairedAccountName: 'Dashboard destination',
+      rsiAccount: { label: 'Previous RSI' },
+      pendingRsiAccount: { id: 'rsi-candidate', label: 'Current RSI' },
+    },
+    (message, status) => {
+      if (message.type === 'confirm-rsi-account') {
+        assert.equal(message.id, 'rsi-candidate');
+        status.rsiAccount = { label: 'Current RSI' };
+        status.pendingRsiAccount = undefined;
+        return { ok: true };
+      }
+      assert.equal(message.type, 'disconnect-current');
+      assert.deepEqual(Object.keys(message), ['type']);
+      if (disconnectAllowed) status.paired = false;
+      return { ok: disconnectAllowed };
+    },
+  );
+  await settle();
+  assert.equal(view.get('paired-account').textContent, 'Dashboard destination');
+  assert.equal(view.get('approved-rsi-account').textContent, 'Previous RSI');
+  view.event('confirm-rsi', 'click');
+  await settle();
+  assert.equal(view.get('approved-rsi-account').textContent, 'Current RSI');
+  assert.equal(view.get('rsi-confirmation').hidden, true);
+  assert.match(view.get('feedback').textContent, /RSI account approved/);
+  const options = view.get('disconnect-options');
+  options.open = true;
+  view.event('disconnect-current', 'click');
+  await settle();
+  assert.equal(options.open, true);
+  assert.match(view.get('feedback').textContent, /Could not disconnect this browser/);
+  disconnectAllowed = true;
+  view.event('disconnect-current', 'click');
+  await settle();
+  assert.equal(options.open, false);
+  assert.equal(view.get('connected').hidden, true);
+  assert.match(view.get('feedback').textContent, /This browser was disconnected/);
+});
+
+test('confirmation controls require a reviewed proposal and report missing worker replies', async (t) => {
+  const view = popup(
+    t,
+    {
+      paired: true,
+      pendingPair: { id: 'cached-dashboard', accountName: 'Dashboard pilot' },
+      pendingRsiAccount: { id: 'cached-rsi', label: 'RSI pilot' },
+    },
+    (message, status) => {
+      if (message.type === 'dismiss-pair') status.pendingPair = undefined;
+      if (message.type === 'dismiss-rsi-account') status.pendingRsiAccount = undefined;
+    },
+  );
+  await settle();
+  view.event('dismiss-pair', 'click');
+  await settle();
+  assert.match(view.get('feedback').textContent, /pairing request has changed/);
+  view.event('dismiss-rsi', 'click');
+  await settle();
+  assert.match(view.get('feedback').textContent, /RSI account request has changed/);
+  const requests = view.sent.filter(({ type }) => type !== 'getStatus').length;
+  for (const button of ['confirm-pair', 'dismiss-pair', 'confirm-rsi', 'dismiss-rsi']) {
+    view.event(button, 'click');
+    await settle();
+  }
+  assert.equal(view.sent.filter(({ type }) => type !== 'getStatus').length, requests);
+});
+
+test('the popup reports a status refresh failure after a connection action', async (t) => {
+  const view = popup(
+    t,
+    { paired: true, pendingPair: { id: 'preview', accountName: 'Dashboard pilot' } },
+    (message, status) => {
+      assert.equal(message.type, 'confirm-pair');
+      status.paired = undefined;
+      return { ok: true };
+    },
+  );
+  await settle();
+  view.event('confirm-pair', 'click');
+  await settle();
+  assert.match(view.get('feedback').textContent, /status is unavailable/);
 });

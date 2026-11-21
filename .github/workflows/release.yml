@@ -7,6 +7,10 @@ on:
   pull_request:
     types: [closed]
 
+concurrency:
+  group: firefox-store-release
+  cancel-in-progress: false
+
 jobs:
   submit:
     # Only run when the PR was merged into `main`.
@@ -23,26 +27,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Zip extensions
-        env:
-          CH_BUILD_PROFILE: production
-        run: |
-          npm run zip
-          npm run zip:firefox
-          node scripts/check-release.cjs
+      - name: Package and verify production archives
+        run: npm run release:prepare:production
 
-      - name: Submit to stores (Firefox only for now)
+      - name: Verify live Dashboard import support
+        run: node scripts/check-dashboard-capabilities.cjs
+
+      - name: Submit Firefox archive
         env:
-          #         CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
-          #         CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
-          #         CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
-          #         CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
           FIREFOX_EXTENSION_ID: 'citizenhangar@sctr.space'
           FIREFOX_JWT_ISSUER: ${{ secrets.FIREFOX_JWT_ISSUER }}
           FIREFOX_JWT_SECRET: ${{ secrets.FIREFOX_JWT_SECRET }}
         run: |
-          # Chrome submission commented out for now
-          # pnpm wxt submit \
-          #   --chrome-zip .output/*-chrome.zip \
-          #   --firefox-zip .output/*-firefox.zip --firefox-sources-zip .output/*-sources.zip
-          npx wxt submit --firefox-zip .output/*-firefox.zip --firefox-sources-zip .output/*-sources.zip
+          archive=".output/$(node -p "const pkg = require('./package.json'); pkg.name + '-' + pkg.version")"
+          npx --no-install wxt submit --firefox-zip "${archive}-firefox.zip" --firefox-sources-zip "${archive}-sources.zip"

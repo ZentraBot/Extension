@@ -13,6 +13,14 @@
     </header>
     <main>
       <p id="feedback" role="status">Checking your connection…</p>
+      <section id="pair-confirmation" aria-labelledby="pair-confirmation-title" hidden>
+        <h2 id="pair-confirmation-title">Approve pairing</h2>
+        <p>Future imports from this browser will go to <strong id="pending-account"></strong>.</p>
+        <div class="row">
+          <button id="confirm-pair" type="button">Approve pairing</button>
+          <button id="dismiss-pair" class="secondary" type="button">Decline</button>
+        </div>
+      </section>
       <section id="pairing" aria-labelledby="pair-title" hidden>
         <h2 id="pair-title">Connect this browser</h2>
         <p>Pair with your Dashboard to sync your RSI pledges.</p>
@@ -43,6 +51,24 @@
       </section>
       <section id="connected" aria-labelledby="connection-title" hidden>
         <h2 id="connection-title">Connected</h2>
+        <dl>
+          <div>
+            <dt>Dashboard account</dt>
+            <dd id="paired-account"></dd>
+          </div>
+          <div>
+            <dt>Approved RSI account</dt>
+            <dd id="approved-rsi-account"></dd>
+          </div>
+        </dl>
+        <section id="rsi-confirmation" aria-labelledby="rsi-confirmation-title" hidden>
+          <h3 id="rsi-confirmation-title">Approve RSI account</h3>
+          <p>Allow imports to use <strong id="pending-rsi-account"></strong>?</p>
+          <div class="row">
+            <button id="confirm-rsi" type="button">Approve account</button>
+            <button id="dismiss-rsi" class="secondary" type="button">Decline</button>
+          </div>
+        </section>
         <div id="sync-progress" hidden>
           <label for="progress">Pages read <span id="progress-label"></span></label>
           <progress id="progress" value="0" max="1"></progress>
@@ -74,6 +100,13 @@
           <button id="cancel-sync" class="secondary" type="button" hidden>Cancel sync</button>
           <a id="pledges" class="button secondary" target="_blank" rel="noopener">View pledges →</a>
         </div>
+        <details id="disconnect-options">
+          <summary>Disconnect this browser</summary>
+          <p>Stops future imports from this browser. Your current inventory stays available.</p>
+          <button id="disconnect-current" class="secondary" type="button">
+            Disconnect browser
+          </button>
+        </details>
       </section>
       <details id="sync-settings" hidden>
         <summary>Sync settings</summary>

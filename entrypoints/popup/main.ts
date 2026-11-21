@@ -1,4 +1,5 @@
 import './style.css';
+import { bindConnectionControls, type ConnectionStatus } from './connection';
 
 type SyncReport = {
   ok: boolean;
@@ -6,8 +7,7 @@ type SyncReport = {
   error?: string;
   reference?: string;
 };
-type Status = {
-  paired: boolean;
+type Status = ConnectionStatus & {
   syncing: boolean;
   lastSync?: number;
   lastResult?: SyncReport;
@@ -23,12 +23,7 @@ type Status = {
 
 const get = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const feedback = get('feedback');
-const code = get<HTMLInputElement>('code');
-const pairing = get('pairing');
-const connected = get('connected');
 const sync = get<HTMLButtonElement>('sync');
-const form = get<HTMLFormElement>('pair-form');
-const pair = form.querySelector('button')!;
 const dev = get<HTMLInputElement>('dev');
 const debug = get<HTMLInputElement>('debug');
 const auto = get<HTMLInputElement>('auto-sync');
@@ -41,6 +36,7 @@ const localAllowed = [
   ...(manifest.host_permissions || []),
 ].includes('http://localhost/*');
 if (!localAllowed) dev.closest('label')!.hidden = true;
+const connection = bindConnectionControls({ get, run, show, watchImport });
 
 /** Translate a persisted import result into an actionable status message. */
 const describe = (result: SyncReport) => {
@@ -53,6 +49,10 @@ const describe = (result: SyncReport) => {
 
   if (result.error === 'rsi_sign_in_required')
     return 'Sign in to RSI in this browser, then try Sync now again.';
+  if (result.error === 'rsi_account_confirmation_required')
+    return 'Review the active RSI account before continuing the import.';
+  if (result.error === 'rsi_account_unverified' || result.error === 'rsi_page_unverified')
+    return 'The extension could not verify the active RSI account. Sign in to RSI and try again.';
   if (result.outcome === 'partial')
     return 'Only part of your hangar could be read. Your previous inventory is still available.';
   if (result.error === 'invalid_eat' || result.error === 'not_paired')
@@ -71,10 +71,13 @@ function show(message: string, error = false) {
 async function refresh() {
   const status: Status = await browser.runtime.sendMessage({ type: 'getStatus' });
   if (typeof status?.paired !== 'boolean') throw new Error('Status unavailable');
-  pairing.hidden = status.paired;
-  connected.hidden = !status.paired;
+  const accountApprovalPending = connection.render(status);
   get('sync-settings').hidden = !status.paired;
-  get('rsi-login').hidden = status.lastResult?.error !== 'rsi_sign_in_required';
+  get('rsi-login').hidden = ![
+    'rsi_sign_in_required',
+    'rsi_account_unverified',
+    'rsi_page_unverified',
+  ].includes(status.lastResult?.error || '');
   auto.checked = status.autoSync;
   get('next-sync').textContent =
     status.autoSync && status.nextSync ? new Date(status.nextSync).toLocaleString('en-GB') : 'Off';
@@ -92,8 +95,8 @@ async function refresh() {
       show(`Will retry at ${new Date(status.progress.retryAt).toLocaleTimeString('en-GB')}.`);
     else show('Reading RSI pledge pages…');
   }
-  pair.disabled = busy;
-  sync.disabled = busy || status.syncing;
+  connection.setBusy(busy);
+  sync.disabled = busy || status.syncing || accountApprovalPending;
   get<HTMLAnchorElement>('pair-dashboard').href = status.dashboardUrl + '/?view=extension';
   get<HTMLAnchorElement>('pledges').href = status.connectionBase + '/?view=pledges';
   get('last-sync').textContent = status.lastSync
@@ -125,45 +128,21 @@ async function refresh() {
 async function run(action: () => Promise<void>) {
   if (busy) return;
   busy = true;
-  pair.disabled = sync.disabled = true;
+  connection.setBusy(true);
+  sync.disabled = true;
   try {
     await action();
   } catch {
     show('The extension could not complete that action. Try again.', true);
   } finally {
     busy = false;
-    pair.disabled = sync.disabled = false;
+    connection.setBusy(false);
+    sync.disabled = false;
     await refresh().catch(() =>
       show('Extension status is unavailable. Reopen the popup to retry.', true),
     );
   }
 }
-
-form.addEventListener('submit', (event) => {
-  event.preventDefault();
-  void run(async () => {
-    show('Pairing this browser…');
-    const result: SyncReport = await browser.runtime.sendMessage({
-      type: 'exchangeCode',
-      code: code.value.trim(),
-    });
-    if (!result?.ok) {
-      const message =
-        result?.error === 'network_error'
-          ? 'Could not reach Citizen Hangar. Try again.'
-          : result?.error === 'extension_disabled'
-            ? 'Pairing is temporarily unavailable. Try again later.'
-            : result?.error === 'invalid_dashboard'
-              ? 'Open the Dashboard to pair this browser.'
-              : 'That code is invalid, expired, or already used. Get a fresh code from the Dashboard.';
-      show(message, true);
-      code.select();
-      return;
-    }
-    form.reset();
-    show('Browser paired. Select Sync now to import your pledges.');
-  });
-});
 
 sync.addEventListener(
   'click',

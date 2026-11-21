@@ -13,7 +13,7 @@ export default defineConfig({
       'process.env.CH_BUILD_PROFILE': JSON.stringify(process.env.CH_BUILD_PROFILE || 'production'),
     },
   }),
-  manifest: () => {
+  manifest: ({ browser }) => {
     const isDev = process.env.CH_BUILD_PROFILE === 'development';
     const hostPermissionsBase = [
       'https://citizenhangar.space/*',
@@ -25,6 +25,7 @@ export default defineConfig({
 
     const gecko = {
       id: 'citizenhangar@sctr.space',
+      strict_min_version: '124.0',
       data_collection_permissions: {
         required: ['authenticationInfo', 'websiteContent', 'websiteActivity'],
         optional: [],
@@ -35,7 +36,6 @@ export default defineConfig({
       name: 'Citizen Hangar Pledge Sync',
       description:
         'Sync Robert Space Industries pledges to the Citizen Hangar backend; pairing and uploads',
-      version: '1.4.0',
       action: {
         default_popup: 'entrypoints/popup/index.html',
       },
@@ -48,8 +48,10 @@ export default defineConfig({
       background: {
         service_worker: 'entrypoints/background.js',
       },
-      // Firefox-specific manifest field recommended by AMO
-      browser_specific_settings: { gecko },
+      // AbortSignal.any is used to combine request deadlines with cancellation.
+      ...(browser === 'firefox'
+        ? { browser_specific_settings: { gecko } }
+        : { minimum_chrome_version: '116' }),
       permissions: ['storage', 'alarms'],
       host_permissions,
       // content scripts are declared via `defineContentScript` in entrypoints/content.ts

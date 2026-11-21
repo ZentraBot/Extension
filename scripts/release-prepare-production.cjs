@@ -5,7 +5,7 @@ const { spawnSync } = require('child_process');
 
 process.env.CH_BUILD_PROFILE = 'production';
 
-const commands = ['wxt build', 'wxt build -b firefox', 'wxt zip', 'wxt zip -b firefox'];
+const commands = ['wxt zip', 'wxt zip -b firefox', 'node scripts/check-release.cjs'];
 
 for (const cmd of commands) {
   report('info', '\n> running:', cmd);
