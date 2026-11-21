@@ -2,12 +2,92 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Citizen Hangar Pledge Sync</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Citizen Hangar</title>
     <meta name="manifest.type" content="browser_action" />
   </head>
   <body>
-    <div id="app"></div>
+    <header>
+      <img src="/icon/48.png" width="32" height="32" alt="" />
+      <h1>Citizen Hangar</h1>
+    </header>
+    <main>
+      <p id="feedback" role="status">Checking your connection…</p>
+      <section id="pairing" aria-labelledby="pair-title" hidden>
+        <h2 id="pair-title">Connect this browser</h2>
+        <p>Pair with your Dashboard to sync your RSI pledges.</p>
+        <a id="pair-dashboard" class="button" target="_blank" rel="noopener"
+          >Open Dashboard to pair →</a
+        >
+        <details id="code-details">
+          <summary>Enter a pairing code</summary>
+          <form id="pair-form">
+            <label for="code">Single-use code</label>
+            <div class="row">
+              <input
+                id="code"
+                name="code"
+                type="text"
+                inputmode="numeric"
+                autocomplete="off"
+                maxlength="6"
+                pattern="[0-9]{6}"
+                required
+                aria-describedby="code-hint"
+              />
+              <button type="submit">Pair</button>
+            </div>
+            <p id="code-hint">Get a six-digit code on the Dashboard’s Extension page.</p>
+          </form>
+        </details>
+      </section>
+      <section id="connected" aria-labelledby="connection-title" hidden>
+        <h2 id="connection-title">Connected</h2>
+        <div id="sync-progress" hidden>
+          <label for="progress">Pages read <span id="progress-label"></span></label>
+          <progress id="progress" value="0" max="1"></progress>
+        </div>
+        <a
+          id="rsi-login"
+          href="https://robertsspaceindustries.com/account/pledges"
+          target="_blank"
+          rel="noopener"
+          hidden
+          >Open the RSI hangar to sign in</a
+        >
+        <dl>
+          <div>
+            <dt>Last successful sync</dt>
+            <dd id="last-sync">Never</dd>
+          </div>
+          <div>
+            <dt>Latest import</dt>
+            <dd id="last-result">No attempts yet</dd>
+          </div>
+          <div>
+            <dt>Next automatic sync</dt>
+            <dd id="next-sync">Off</dd>
+          </div>
+        </dl>
+        <div class="row">
+          <button id="sync" type="button">Sync now</button>
+          <button id="cancel-sync" class="secondary" type="button" hidden>Cancel sync</button>
+          <a id="pledges" class="button secondary" target="_blank" rel="noopener">View pledges →</a>
+        </div>
+      </section>
+      <details id="sync-settings" hidden>
+        <summary>Sync settings</summary>
+        <label><input id="auto-sync" type="checkbox" /> Import automatically every hour</label>
+      </details>
+      <details class="diagnostics">
+        <summary>Diagnostics</summary>
+        <p id="support-reference" hidden>Support reference<br /><code id="support-code"></code></p>
+        <label><input type="checkbox" id="dev" /> Use local Dashboard for new pairing</label>
+        <label><input type="checkbox" id="debug" /> Record diagnostic messages</label>
+        <button type="button" class="secondary" id="clear-logs">Clear diagnostics</button>
+        <pre id="logs">No diagnostic messages.</pre>
+      </details>
+    </main>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

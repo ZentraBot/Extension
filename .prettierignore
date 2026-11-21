@@ -1,0 +1,8 @@
+package-lock.json
+coverage/
+samples/
+.output/
+.wxt/
+.coverage-compiled/
+
+**/*.md

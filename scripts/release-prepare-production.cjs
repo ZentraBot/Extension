@@ -1,27 +1,23 @@
 #!/usr/bin/env node
-// Cross-platform helper to fake production by setting FIREFOX_JWT_ISSUER
+const { report } = require('./console.cjs');
+// Build release archives without development hosts.
 const { spawnSync } = require('child_process');
 
-process.env.FIREFOX_JWT_ISSUER = process.env.FIREFOX_JWT_ISSUER || '.';
+process.env.CH_BUILD_PROFILE = 'production';
 
-const commands = [
-  'wxt build',
-  'wxt build -b firefox',
-  'wxt zip',
-  'wxt zip -b firefox',
-];
+const commands = ['wxt build', 'wxt build -b firefox', 'wxt zip', 'wxt zip -b firefox'];
 
 for (const cmd of commands) {
-  console.log('\n> running:', cmd);
+  report('info', '\n> running:', cmd);
   const res = spawnSync(cmd, { shell: true, stdio: 'inherit' });
   if (res.error) {
-    console.error('Command failed:', cmd, res.error);
+    report('error', 'Command failed:', cmd, res.error);
     process.exit(1);
   }
   if (res.status !== 0) {
-    console.error('Command exited with non-zero status', res.status);
+    report('error', 'Command exited with non-zero status', res.status);
     process.exit(res.status || 1);
   }
 }
 
-console.log('\nAll commands completed successfully.');
+report('info', '\nAll commands completed successfully.');

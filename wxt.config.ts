@@ -1,14 +1,20 @@
-import { defineConfig, type ConfigEnv, type UserManifest } from 'wxt';
+import { defineConfig, type UserManifest } from 'wxt';
 import path from 'path';
 
 const userDataDir = path.resolve(process.cwd(), '.wxt', 'chrome-data').replace(/\\/g, '/');
 
 export default defineConfig({
-  manifest: (env: ConfigEnv) => {
-    // Treat presence of FIREFOX_JWT_ISSUER as production indicator.
-    // If the env var exists, consider this a production build and do not include local hosts.
-    const hasFirefoxJwtIssuer = typeof process.env.FIREFOX_JWT_ISSUER === 'string' && process.env.FIREFOX_JWT_ISSUER.trim() !== '';
-    const isDev = !hasFirefoxJwtIssuer;
+  // Generated coverage contains machine-specific paths and is only a CI artifact.
+  zip: {
+    excludeSources: ['coverage', 'coverage/**', '.coverage-compiled', '.coverage-compiled/**'],
+  },
+  vite: () => ({
+    define: {
+      'process.env.CH_BUILD_PROFILE': JSON.stringify(process.env.CH_BUILD_PROFILE || 'production'),
+    },
+  }),
+  manifest: () => {
+    const isDev = process.env.CH_BUILD_PROFILE === 'development';
     const hostPermissionsBase = [
       'https://citizenhangar.space/*',
       'https://robertsspaceindustries.com/*',
@@ -17,12 +23,19 @@ export default defineConfig({
       ? [...hostPermissionsBase, 'http://localhost/*', 'http://127.0.0.1/*']
       : hostPermissionsBase;
 
+    const gecko = {
+      id: 'citizenhangar@sctr.space',
+      data_collection_permissions: {
+        required: ['authenticationInfo', 'websiteContent', 'websiteActivity'],
+        optional: [],
+      },
+    };
+
     const manifest: UserManifest = {
       name: 'Citizen Hangar Pledge Sync',
       description:
         'Sync Robert Space Industries pledges to the Citizen Hangar backend; pairing and uploads',
-      manifest_version: 3,
-      version: '1.3.4',
+      version: '1.4.0',
       action: {
         default_popup: 'entrypoints/popup/index.html',
       },
@@ -36,17 +49,7 @@ export default defineConfig({
         service_worker: 'entrypoints/background.js',
       },
       // Firefox-specific manifest field recommended by AMO
-      browser_specific_settings: {
-        gecko: {
-          id: 'citizenhangar@sctr.space',
-          // AMO data collection schema: list required/optional data types
-          data_collection_permissions: {
-            // Required data types collected/transmitted by the add-on (AMO schema)
-            required: ['authenticationInfo', 'websiteContent', 'websiteActivity'],
-            optional: [],
-          },
-        },
-      },
+      browser_specific_settings: { gecko },
       permissions: ['storage', 'alarms'],
       host_permissions,
       // content scripts are declared via `defineContentScript` in entrypoints/content.ts
@@ -60,4 +63,3 @@ export default defineConfig({
     chromiumArgs: [`--user-data-dir=${userDataDir}`],
   },
 });
-
