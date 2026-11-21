@@ -1,7 +1,10 @@
+import { browserWarning } from '../utils/console';
+
 const hostMatchesBase = ['https://citizenhangar.space/*'];
-const hasFirefoxJwtIssuer = typeof process !== 'undefined' && typeof process.env === 'object' && typeof process.env.FIREFOX_JWT_ISSUER === 'string' && process.env.FIREFOX_JWT_ISSUER.trim() !== '';
-const isDev = !hasFirefoxJwtIssuer;
-const matches = isDev ? [...hostMatchesBase, 'http://localhost/*', 'http://127.0.0.1/*'] : hostMatchesBase;
+const isDev = process.env.CH_BUILD_PROFILE === 'development';
+const matches = isDev
+  ? [...hostMatchesBase, 'http://localhost/*', 'http://127.0.0.1/*']
+  : hostMatchesBase;
 
 export default defineContentScript({
   matches,
@@ -9,15 +12,11 @@ export default defineContentScript({
     const runtime = (globalThis as any).browser?.runtime ?? (globalThis as any).chrome?.runtime;
     const CHANNEL_NAMES = ['CITIZEN_HANGAR_EXTENSION', 'SCTR_EXTENSION'];
     const READY_EVENTS = ['citizen-hangar-extension-ready', 'sctr-extension-ready'];
-    const allowedOriginPatterns = [
-      /^https?:\/\/localhost(?::\d+)?$/i,
-      /^https?:\/\/127\.0\.0\.1(?::\d+)?$/i,
-      /^https?:\/\/\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?$/i,
-      /^https?:\/\/([a-z0-9-]+\.)?(citizenhangar|sctr|starhoppers)\.space$/i,
-    ];
+    const isAllowedOrigin = (origin: string) =>
+      origin === 'https://citizenhangar.space' ||
+      (isDev && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin));
 
-    const isAllowedOrigin = (origin = '') => allowedOriginPatterns.some((pattern) => pattern.test(origin));
-
+    /** Forward one validated Dashboard message using the runtime available in this browser. */
     function sendRuntimeMessage(payload: any) {
       // Helper: wait for a runtime to appear (browser or chrome) for up to `timeoutMs`.
       const waitForRuntime = (timeoutMs = 5000, pollMs = 100) => {
@@ -46,7 +45,7 @@ export default defineContentScript({
           try {
             return await g.browser.runtime.sendMessage(payload);
           } catch (err) {
-            console.warn('content: browser.runtime.sendMessage threw', err);
+            browserWarning('The extension runtime rejected a Dashboard message', err);
             return { ok: false, error: err instanceof Error ? err.message : 'runtime_error' };
           }
         }
@@ -78,6 +77,7 @@ export default defineContentScript({
       })();
     }
 
+    /** Send a bridge response back to the same origin that issued the request. */
     function reply(origin: string, payload: any, channel = CHANNEL_NAMES[0]) {
       try {
         window.postMessage({ source: channel, ...payload }, origin);
@@ -90,6 +90,7 @@ export default defineContentScript({
     let readyAnnounced = false;
     const activeRequests = new Set<string>();
 
+    /** Announce both channel names once for compatibility with older Dashboard pages. */
     function announceReady() {
       if (readyAnnounced) return;
       if (!isAllowedOrigin(pageOrigin)) return;
@@ -103,7 +104,8 @@ export default defineContentScript({
     }
 
     announceReady();
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', announceReady);
+    if (document.readyState === 'loading')
+      document.addEventListener('DOMContentLoaded', announceReady);
 
     window.addEventListener('message', (event) => {
       if (event.source !== window) return;
@@ -122,24 +124,60 @@ export default defineContentScript({
       if (requestId && activeRequests.has(requestId)) return;
       if (requestId) activeRequests.add(requestId);
 
-      const finalizeRequest = () => { if (requestId) activeRequests.delete(requestId); };
+      const finalizeRequest = () => {
+        if (requestId) activeRequests.delete(requestId);
+      };
 
       if (data.type === 'PAIR' && data.payload && data.payload.code) {
-        sendRuntimeMessage({ action: 'pair', code: data.payload.code, baseUrl: data.payload.baseUrl, devMode: data.payload.devMode })
-          .then((response: any) => reply(event.origin, { type: 'PAIR_RESULT', requestId, response }, channel))
-          .catch((error: any) => reply(event.origin, { type: 'PAIR_RESULT', requestId, response: { ok: false, error: error && error.message ? error.message : 'runtime_error' } }, channel))
+        sendRuntimeMessage({
+          action: 'pair',
+          code: data.payload.code,
+          baseUrl: data.payload.baseUrl,
+          devMode: data.payload.devMode,
+        })
+          .then((response: any) =>
+            reply(event.origin, { type: 'PAIR_RESULT', requestId, response }, channel),
+          )
+          .catch((error: any) =>
+            reply(
+              event.origin,
+              {
+                type: 'PAIR_RESULT',
+                requestId,
+                response: {
+                  ok: false,
+                  error: error && error.message ? error.message : 'runtime_error',
+                },
+              },
+              channel,
+            ),
+          )
           .finally(finalizeRequest);
         return;
       }
 
       if (data.type === 'REVOKE') {
         sendRuntimeMessage({ action: 'revoke' })
-          .then((response: any) => reply(event.origin, { type: 'REVOKE_RESULT', requestId, response }, channel))
-          .catch((error: any) => reply(event.origin, { type: 'REVOKE_RESULT', requestId, response: { ok: false, error: error && error.message ? error.message : 'runtime_error' } }, channel))
+          .then((response: any) =>
+            reply(event.origin, { type: 'REVOKE_RESULT', requestId, response }, channel),
+          )
+          .catch((error: any) =>
+            reply(
+              event.origin,
+              {
+                type: 'REVOKE_RESULT',
+                requestId,
+                response: {
+                  ok: false,
+                  error: error && error.message ? error.message : 'runtime_error',
+                },
+              },
+              channel,
+            ),
+          )
           .finally(finalizeRequest);
       }
+      finalizeRequest();
     });
-
-    console.log('SCTR content script active');
   },
 });
