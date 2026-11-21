@@ -39,6 +39,24 @@ h2 {
   letter-spacing: -0.045em;
   margin: 0.65rem 0;
 }
+h3 {
+  font-size: 1rem;
+  margin: 0 0 0.5rem;
+}
+#pair-confirmation,
+#rsi-confirmation {
+  border: 1px solid var(--rule);
+  border-left-color: var(--accent);
+  padding: 0.65rem 0.75rem 0.75rem;
+  margin-bottom: 0.8rem;
+  background: #181717;
+}
+#pending-account,
+#pending-rsi-account,
+#paired-account,
+#approved-rsi-account {
+  overflow-wrap: anywhere;
+}
 p {
   color: var(--muted);
   margin: 0.5rem 0 0.8rem;
